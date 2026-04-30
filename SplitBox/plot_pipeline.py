@@ -1,4 +1,5 @@
 import asyncio
+import json
 import random
 import time
 
@@ -48,6 +49,28 @@ def plot_timings():
 	plt.bar(b_x, b_tops, bottom=b_bottoms, edgecolor="black", color="blue")
 
 	plt.show()
+
+def reset_timings():
+    global task_timings, global_start
+    task_timings = []
+    global_start = time.time()
+
+def save_trace(path="trace.json"):
+    events = []
+    for dp in task_timings:
+        d, w, s = parse_task_str(dp["task_str"])
+        name = f"{'forward' if d == 'f' else 'backward'} s{s}"
+        tid = 0 if d == "f" else 1
+        events.append({
+            "name": name,
+            "ph": "X",
+            "ts": dp["start"] * 1e6,
+            "dur": (dp["end"] - dp["start"]) * 1e6,
+            "pid": w,
+            "tid": tid,
+        })
+    with open(path, "w") as f:
+        json.dump({"traceEvents": events}, f)
 
 def metrics_wrapper(task_str, coro):
 

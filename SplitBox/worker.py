@@ -2,11 +2,14 @@ import torch
 import axon
 import cloudpickle
 import random
+import time
 
 from torch import nn
 from torch.nn import functional as F
 from concurrent.futures import ThreadPoolExecutor
 from sys import argv as args
+
+from SplitBox.tracer import tracer, TID_COMPUTE, TID_COMM
 
 dtype = torch.float32
 device = "cpu"
@@ -155,9 +158,10 @@ class BlockStack():
 # this class is concerned with retrieving and storing activations and gratients to support backpropagation
 class Worker():
 
-    def __init__(self, net, device=device, stub_cache={}):
+    def __init__(self, net, device=device, stub_cache={}, worker_id=0):
         self.device = device
         self.net = net
+        self.worker_id = worker_id
         self.saved_inputs = {}
         self.saved_outputs = {}
         self.saved_input_grads = {}
@@ -182,12 +186,14 @@ class Worker():
 
         x_tup = self.saved_inputs[activation_id]
 
+        t0 = time.time()
         if inference:
             with torch.no_grad():
                 y = self.net(*x_tup)
         else:
             with torch.enable_grad():
                 y = self.net(*x_tup)
+        tracer.record("forward", self.worker_id, TID_COMPUTE, t0, time.time())
 
         self.saved_outputs[activation_id] = as_tuple(y)
 
@@ -198,7 +204,7 @@ class Worker():
         if activation_id not in self.saved_inputs: raise BaseException(f"Input activations not found with ID: {activation_id}")
         if activation_id not in self.saved_outputs: raise BaseException(f"Output activations not found with ID: {activation_id}")
         if activation_id not in self.saved_output_grads: raise BaseException(f"Output gradients not found with ID: {activation_id}")
-        
+
         x_tup = self.saved_inputs[activation_id]
         y_tup = self.saved_outputs[activation_id]
         g_tup = self.saved_output_grads[activation_id]
@@ -207,7 +213,9 @@ class Worker():
             x.requires_grad_(True)
             x.retain_grad()
 
+        t0 = time.time()
         torch.autograd.backward(y_tup, g_tup)
+        tracer.record("backward", self.worker_id, TID_COMPUTE, t0, time.time())
 
         self.saved_input_grads[activation_id] = tuple(x.grad for x in x_tup)
 
@@ -221,6 +229,7 @@ class Worker():
 
         x_tup = self.saved_inputs[activation_id]
 
+        t0 = time.time()
         y = self.net(*x_tup)
         y_tup = as_tuple(y)
 
@@ -237,6 +246,7 @@ class Worker():
         criterion = cloudpickle.loads(criterion_str)
         loss = criterion(*y_detached, target)
         (loss * loss_scale).backward()
+        tracer.record("final_stage", self.worker_id, TID_COMPUTE, t0, time.time())
 
         self.saved_outputs[activation_id] = y_tup
         self.saved_output_grads[activation_id] = tuple(y_hat.grad for y_hat in y_detached)
@@ -274,13 +284,22 @@ class Worker():
 
     def fetch_activations(self, activation_id, source_URL, clear_cache=False):
         remote_block = self.get_stub(source_URL)
+        t0 = time.time()
         x = remote_block.get_activations(activation_id, clear_cache=clear_cache)
+        tracer.record("fetch_activations", self.worker_id, TID_COMM, t0, time.time())
         self.saved_inputs[activation_id] = as_tuple(x)
 
     def fetch_gradients(self, activation_id, source_URL, clear_cache=False):
         remote_block = self.get_stub(source_URL)
+        t0 = time.time()
         g = remote_block.get_gradients(activation_id, clear_cache=clear_cache)
+        tracer.record("fetch_gradients", self.worker_id, TID_COMM, t0, time.time())
         self.saved_output_grads[activation_id] = as_tuple(g)
+
+    def save_trace(self, path=None):
+        if path is None:
+            path = f"worker_{self.worker_id}_trace.json"
+        tracer.save(path)
 
     def clear_cache(self, activation_id=None):
         
@@ -313,7 +332,7 @@ def local_mode():
     tpe = ThreadPoolExecutor(10)
 
     stack = BlockStack()
-    worker = Worker(stack)
+    worker = Worker(stack, worker_id=int(port))
 
     axon.worker.service(worker, 'llama_worker', tl=tl, depth=1, executor=tpe)
     axon.worker.service(stack, 'block_stack', tl=socket_tl, depth=1, executor=tpe)

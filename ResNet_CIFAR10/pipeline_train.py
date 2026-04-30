@@ -110,6 +110,7 @@ async def train(stubs, block_stubs, urls):
         return 100.0 * correct / total
 
     print("Starting training!")
+    i = 0
     for epoch in range(1, EPOCHS + 1):
         await global_stub.train_mode([(True,) for _ in stubs])
 
@@ -124,7 +125,10 @@ async def train(stubs, block_stubs, urls):
             await global_stub.clear_cache()
             epoch_losses.extend(losses)
 
-            # plot_timings()
+            i += 1
+            if (i == 3): 
+                plot_timings()
+                exit()
 
         await multi_block_stub.scheduler_step()
 
